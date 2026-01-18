@@ -2,9 +2,11 @@
 Vehicle Distance & Overtaking Analyzer for Uni_west_1 Dataset
 
 Calculates:
-- Distance between vehicles (center-to-center)
+- Distance between vehicles (edge-to-edge, not center-to-center)
 - Overtaking events with minimum lateral distance
 - Following distances (same lane)
+
+Uses the closest edges of 3D bounding boxes for practical distance measurement.
 
 Outputs:
 - Annotated video with distance lines
@@ -25,7 +27,7 @@ from bbox_3d_calibrated import BBox3DGenerator
 # Paths
 DATASET_DIR = "/Users/navaneethmalingan/3D/Uni_west_1"
 LOOKUP_TABLE = f"{DATASET_DIR}/calibration-lookup-table.npy"
-OUTPUT_DIR = f"{DATASET_DIR}/output"
+OUTPUT_DIR = f"{DATASET_DIR}/output/edge_distance"
 
 # Speed scale (from previous calibration)
 SPEED_SCALE = 0.25
@@ -147,8 +149,98 @@ class DistanceAnalyzer:
         self.overtaking_events = []  # Detected overtaking events
         self.active_overtakes = {}  # Currently tracked potential overtakes
 
+    def _get_bbox_corners_world(self, bbox) -> np.ndarray:
+        """Get the 4 bottom corners of 3D bbox in world coordinates (ground plane)."""
+        # corners_world is 8x3 array: corners 0-3 are bottom, 4-7 are top
+        # We use bottom corners for distance calculation (ground plane)
+        return bbox.corners_world[:4, :2]  # Shape: (4, 2) - just x, y
+
+    def _min_edge_distance(self, corners_a: np.ndarray, corners_b: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
+        """
+        Calculate minimum edge-to-edge distance between two bounding boxes.
+
+        Returns:
+            - min_distance: minimum distance between closest points
+            - closest_point_a: closest point on bbox A
+            - closest_point_b: closest point on bbox B
+        """
+        min_dist = float('inf')
+        closest_a = None
+        closest_b = None
+
+        # Check all corner-to-corner distances
+        for i, ca in enumerate(corners_a):
+            for j, cb in enumerate(corners_b):
+                dist = np.sqrt((ca[0] - cb[0])**2 + (ca[1] - cb[1])**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_a = ca.copy()
+                    closest_b = cb.copy()
+
+        # Check point-to-edge distances for more accuracy
+        # For each corner of A, find distance to each edge of B, and vice versa
+        for corners_from, corners_to, is_a_to_b in [(corners_a, corners_b, True), (corners_b, corners_a, False)]:
+            for point in corners_from:
+                n_corners = len(corners_to)
+                for k in range(n_corners):
+                    # Edge from corner k to corner (k+1) % n
+                    edge_start = corners_to[k]
+                    edge_end = corners_to[(k + 1) % n_corners]
+
+                    # Project point onto edge
+                    edge_vec = edge_end - edge_start
+                    edge_len_sq = np.dot(edge_vec, edge_vec)
+
+                    if edge_len_sq > 0:
+                        t = max(0, min(1, np.dot(point - edge_start, edge_vec) / edge_len_sq))
+                        projection = edge_start + t * edge_vec
+                        dist = np.sqrt((point[0] - projection[0])**2 + (point[1] - projection[1])**2)
+
+                        if dist < min_dist:
+                            min_dist = dist
+                            if is_a_to_b:
+                                closest_a = point.copy()
+                                closest_b = projection.copy()
+                            else:
+                                closest_a = projection.copy()
+                                closest_b = point.copy()
+
+        return min_dist, closest_a, closest_b
+
+    def _edge_to_edge_distance(self, bbox_a, bbox_b) -> Dict:
+        """
+        Calculate edge-to-edge distance between two 3D bounding boxes.
+
+        Returns dict with:
+            - edge_distance: minimum distance between closest edges
+            - closest_point_a: closest point on vehicle A (world coords)
+            - closest_point_b: closest point on vehicle B (world coords)
+            - longitudinal_gap: gap along road direction (X-axis)
+            - lateral_gap: gap across road (Y-axis)
+        """
+        corners_a = self._get_bbox_corners_world(bbox_a)
+        corners_b = self._get_bbox_corners_world(bbox_b)
+
+        # Calculate minimum edge-to-edge distance
+        min_dist, closest_a, closest_b = self._min_edge_distance(corners_a, corners_b)
+
+        # Calculate longitudinal and lateral components of the gap
+        # Using the closest points, not centers
+        dx = closest_b[0] - closest_a[0]
+        dy = closest_b[1] - closest_a[1]
+
+        return {
+            'edge_distance': min_dist,
+            'closest_point_a': closest_a,
+            'closest_point_b': closest_b,
+            'longitudinal_gap': abs(dx),
+            'lateral_gap': abs(dy),
+            'dx': dx,
+            'dy': dy
+        }
+
     def calculate_distances(self, tracks: Dict, frame_idx: int, frame_time: float) -> List[Dict]:
-        """Calculate all pairwise distances between active vehicles."""
+        """Calculate all pairwise edge-to-edge distances between active vehicles."""
         distances = []
 
         # Get active tracks (visible this frame)
@@ -162,44 +254,58 @@ class DistanceAnalyzer:
                 tid_a = track_ids[i]
                 tid_b = track_ids[j]
 
-                pos_a = active[tid_a]['positions'][-1]
-                pos_b = active[tid_b]['positions'][-1]
+                bbox_a = active[tid_a]['last_bbox']
+                bbox_b = active[tid_b]['last_bbox']
 
-                # Calculate distances
-                dx = pos_b[0] - pos_a[0]  # Longitudinal (along road)
-                dy = pos_b[1] - pos_a[1]  # Lateral (across road)
-                total_dist = np.sqrt(dx**2 + dy**2)
+                # Calculate edge-to-edge distance (practical distance)
+                edge_info = self._edge_to_edge_distance(bbox_a, bbox_b)
+
+                # Also get center positions for reference
+                center_a = active[tid_a]['positions'][-1]
+                center_b = active[tid_b]['positions'][-1]
+                center_dx = center_b[0] - center_a[0]
+                center_dy = center_b[1] - center_a[1]
 
                 dist_record = {
                     'frame': frame_idx,
                     'time': frame_time,
                     'vehicle_a': tid_a,
                     'vehicle_b': tid_b,
-                    'pos_a_x': pos_a[0],
-                    'pos_a_y': pos_a[1],
-                    'pos_b_x': pos_b[0],
-                    'pos_b_y': pos_b[1],
-                    'distance_longitudinal': abs(dx),
-                    'distance_lateral': abs(dy),
-                    'distance_total': total_dist
+                    # Center positions (for reference)
+                    'center_a_x': center_a[0],
+                    'center_a_y': center_a[1],
+                    'center_b_x': center_b[0],
+                    'center_b_y': center_b[1],
+                    # Edge-to-edge distances (practical)
+                    'edge_distance': edge_info['edge_distance'],
+                    'longitudinal_gap': edge_info['longitudinal_gap'],
+                    'lateral_gap': edge_info['lateral_gap'],
+                    # Closest points
+                    'closest_a_x': edge_info['closest_point_a'][0],
+                    'closest_a_y': edge_info['closest_point_a'][1],
+                    'closest_b_x': edge_info['closest_point_b'][0],
+                    'closest_b_y': edge_info['closest_point_b'][1],
                 }
 
                 distances.append(dist_record)
                 self.distance_log.append(dist_record)
 
-                # Check for overtaking
-                self._check_overtaking(tid_a, tid_b, pos_a, pos_b, dx, dy,
-                                       total_dist, frame_idx, frame_time)
+                # Check for overtaking using edge distance
+                self._check_overtaking(tid_a, tid_b, center_a, center_b,
+                                       center_dx, center_dy,
+                                       edge_info['edge_distance'],
+                                       edge_info['lateral_gap'],
+                                       frame_idx, frame_time)
 
         return distances
 
     def _check_overtaking(self, tid_a, tid_b, pos_a, pos_b, dx, dy,
-                          total_dist, frame_idx, frame_time):
-        """Detect and track overtaking events."""
+                          edge_distance, lateral_gap, frame_idx, frame_time):
+        """Detect and track overtaking events using edge-to-edge distance."""
         pair_key = tuple(sorted([tid_a, tid_b]))
 
-        lateral_dist = abs(dy)
-        long_dist = abs(dx)
+        lateral_dist = lateral_gap  # Use edge-to-edge lateral gap
+        long_dist = abs(dx)  # Use center-based longitudinal for direction detection
 
         # Check if vehicles are close enough to be overtaking
         if (lateral_dist < self.OVERTAKING_LATERAL_THRESHOLD and
@@ -210,7 +316,7 @@ class DistanceAnalyzer:
                 self.active_overtakes[pair_key] = {
                     'frame_start': frame_idx,
                     'min_lateral': lateral_dist,
-                    'min_total': total_dist,
+                    'min_edge': edge_distance,  # Edge-to-edge distance
                     'initial_dx': dx,  # Who was ahead initially
                     'tid_a': tid_a,
                     'tid_b': tid_b
@@ -219,7 +325,7 @@ class DistanceAnalyzer:
                 # Update minimum distances
                 ot = self.active_overtakes[pair_key]
                 ot['min_lateral'] = min(ot['min_lateral'], lateral_dist)
-                ot['min_total'] = min(ot['min_total'], total_dist)
+                ot['min_edge'] = min(ot['min_edge'], edge_distance)
                 ot['last_dx'] = dx
                 ot['frame_end'] = frame_idx
         else:
@@ -241,12 +347,12 @@ class DistanceAnalyzer:
                         vehicle_a_id=ot['tid_a'],
                         vehicle_b_id=ot['tid_b'],
                         min_lateral_distance=ot['min_lateral'],
-                        min_total_distance=ot['min_total'],
+                        min_total_distance=ot['min_edge'],  # Edge-to-edge distance
                         overtaking_vehicle=overtaker
                     )
                     self.overtaking_events.append(event)
                     print(f"  OVERTAKING DETECTED: Vehicle {overtaker} overtook, "
-                          f"min lateral distance: {ot['min_lateral']:.2f}m")
+                          f"min edge distance: {ot['min_edge']:.2f}m")
 
                 del self.active_overtakes[pair_key]
 
@@ -266,7 +372,7 @@ class DistanceAnalyzer:
         with open(ot_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['frame_start', 'frame_end', 'vehicle_a', 'vehicle_b',
-                            'min_lateral_dist_m', 'min_total_dist_m', 'overtaking_vehicle'])
+                            'min_lateral_gap_m', 'min_edge_distance_m', 'overtaking_vehicle'])
             for e in self.overtaking_events:
                 writer.writerow([e.frame_start, e.frame_end, e.vehicle_a_id,
                                 e.vehicle_b_id, f"{e.min_lateral_distance:.2f}",
@@ -274,10 +380,10 @@ class DistanceAnalyzer:
         print(f"  Saved {len(self.overtaking_events)} overtaking events to {ot_path}")
 
 
-def draw_distances(frame, tracks, distances, analyzer):
-    """Draw distance lines between nearby vehicles."""
+def draw_distances(frame, tracks, distances, analyzer, generator):
+    """Draw distance lines between closest edges of nearby vehicles."""
     for dist in distances:
-        if dist['distance_total'] > analyzer.MIN_DISTANCE_DISPLAY:
+        if dist['edge_distance'] > analyzer.MIN_DISTANCE_DISPLAY:
             continue
 
         tid_a = dist['vehicle_a']
@@ -292,19 +398,40 @@ def draw_distances(frame, tracks, distances, analyzer):
         if bbox_a is None or bbox_b is None:
             continue
 
-        # Get center points in image coordinates
-        center_a = bbox_a.corners_image[:4].mean(axis=0).astype(int)
-        center_b = bbox_b.corners_image[:4].mean(axis=0).astype(int)
+        # Get closest points in world coordinates from the distance record
+        closest_a_world = np.array([dist['closest_a_x'], dist['closest_a_y']])
+        closest_b_world = np.array([dist['closest_b_x'], dist['closest_b_y']])
 
-        # Draw line
+        # Convert world coordinates to image coordinates
+        # Find the closest corner in image space to approximate the closest point
+        corners_a = bbox_a.corners_image[:4]  # Bottom 4 corners
+        corners_b = bbox_b.corners_image[:4]
+        corners_a_world = bbox_a.corners_world[:4, :2]
+        corners_b_world = bbox_b.corners_world[:4, :2]
+
+        # Find closest corner in image space for vehicle A
+        dist_to_corners_a = np.sqrt(np.sum((corners_a_world - closest_a_world)**2, axis=1))
+        closest_idx_a = np.argmin(dist_to_corners_a)
+        img_point_a = corners_a[closest_idx_a].astype(int)
+
+        # Find closest corner in image space for vehicle B
+        dist_to_corners_b = np.sqrt(np.sum((corners_b_world - closest_b_world)**2, axis=1))
+        closest_idx_b = np.argmin(dist_to_corners_b)
+        img_point_b = corners_b[closest_idx_b].astype(int)
+
+        # Draw line between closest edges
         color = (0, 165, 255)  # Orange
-        cv.line(frame, tuple(center_a), tuple(center_b), color, 2)
+        cv.line(frame, tuple(img_point_a), tuple(img_point_b), color, 2)
+
+        # Draw small circles at the closest points
+        cv.circle(frame, tuple(img_point_a), 4, (0, 255, 255), -1)
+        cv.circle(frame, tuple(img_point_b), 4, (0, 255, 255), -1)
 
         # Draw distance label at midpoint
-        mid_x = (center_a[0] + center_b[0]) // 2
-        mid_y = (center_a[1] + center_b[1]) // 2
+        mid_x = (img_point_a[0] + img_point_b[0]) // 2
+        mid_y = (img_point_a[1] + img_point_b[1]) // 2
 
-        label = f"{dist['distance_total']:.1f}m"
+        label = f"{dist['edge_distance']:.1f}m"
         cv.rectangle(frame, (mid_x - 30, mid_y - 12), (mid_x + 30, mid_y + 5), (0, 0, 0), -1)
         cv.putText(frame, label, (mid_x - 25, mid_y),
                    cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
@@ -396,8 +523,8 @@ def process_video(video_path: str, output_path: str, generator, max_frames: int 
             speed = tracker.get_speed(track)
             draw_3d_box(frame, track['last_bbox'], track['color'], speed, tid)
 
-        # Draw distance lines
-        frame = draw_distances(frame, tracks, distances, analyzer)
+        # Draw distance lines (edge-to-edge)
+        frame = draw_distances(frame, tracks, distances, analyzer, generator)
 
         out.write(frame)
         frame_idx += 1
@@ -410,8 +537,9 @@ def process_video(video_path: str, output_path: str, generator, max_frames: int 
 
     print(f"  Video saved to: {output_path}")
 
-    # Save CSV results
-    analyzer.save_results(OUTPUT_DIR, video_name)
+    # Save CSV results to the same directory as the video
+    output_dir = os.path.dirname(output_path)
+    analyzer.save_results(output_dir, video_name)
 
     return analyzer
 
@@ -432,7 +560,7 @@ def main():
     videos = [
         ("GOPR0574.MP4", None),      # Full video
         ("GOPR0575.MP4", None),      # Full video
-        ("GOPR0581.MP4", 5000),      # First 5000 frames (large video)
+        ("GOPR0581.MP4", None),      # Full video
     ]
 
     # Check command line args
