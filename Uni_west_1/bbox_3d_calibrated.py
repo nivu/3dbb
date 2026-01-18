@@ -1,0 +1,409 @@
+"""
+3D Bounding Box Generator - Calibrated for Uni_west_1 Dataset
+
+Uses calibration lookup table to convert 2D vehicle detections to 3D world coordinates
+and project 3D bounding boxes back onto the image.
+
+Parameters have been calibrated from manual adjustments on vehicles in this dataset.
+"""
+
+import numpy as np
+import cv2 as cv
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("Warning: ultralytics not installed. Install with: pip install ultralytics")
+
+
+@dataclass
+class BBox2D:
+    """2D bounding box in image coordinates"""
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    confidence: float
+    class_id: int
+    class_name: str
+
+
+@dataclass
+class BBox3D:
+    """3D bounding box"""
+    corners_image: np.ndarray  # 8x2 array - corners in image coordinates
+    corners_world: np.ndarray  # 8x3 array - corners in world coordinates
+    center: np.ndarray         # [x, y, z] world coordinates
+    length: float
+    width: float
+    height: float
+    yaw: float
+    bbox_2d: BBox2D
+    confidence: float
+
+
+class BBox3DGenerator:
+    """Generates 3D bounding boxes from 2D detections using calibration data"""
+
+    # =========================================================================
+    # CALIBRATED PARAMETERS FOR UNI_WEST_1 DATASET
+    # Averaged from 10 manual adjustments, with front_inset adjusted for better coverage
+    # =========================================================================
+    DEPTH_RATIO = 0.5361        # How far rear extends up (as ratio of bbox height)
+    SIDE_OFFSET_RATIO = -0.5267 # How far rear shifts (negative = left)
+    HEIGHT_RATIO = 0.5796       # Box height vs bbox height
+    SHRINK_RATIO = 0.9093       # Rear width vs front width
+    FRONT_INSET_LEFT = 0.45     # Left side inset for points 0,4 (45% toward 1,5)
+    FRONT_INSET_RIGHT = 0.02    # Right side inset for points 1,5 (keep near edge)
+    # =========================================================================
+
+    VEHICLE_DIMENSIONS = {
+        'car': {'length': 4.5, 'width': 1.8, 'height': 1.5},
+        'truck': {'length': 6.0, 'width': 2.5, 'height': 2.5},
+        'bus': {'length': 12.0, 'width': 2.5, 'height': 3.0},
+        'motorcycle': {'length': 2.2, 'width': 0.8, 'height': 1.2},
+        'bicycle': {'length': 1.8, 'width': 0.6, 'height': 1.1},
+        'person': {'length': 0.5, 'width': 0.5, 'height': 1.7},
+    }
+
+    VEHICLE_CLASSES = {
+        2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck', 1: 'bicycle', 0: 'person',
+    }
+
+    def __init__(self, lookup_table_path: str, yolo_model: str = 'yolov8n.pt'):
+        self.lookup_table = np.load(lookup_table_path)
+        self.lt_width, self.lt_height, _ = self.lookup_table.shape
+        print(f"Loaded lookup table: {self.lookup_table.shape}")
+
+        self.img_width = None
+        self.img_height = None
+
+        if YOLO_AVAILABLE:
+            self.model = YOLO(yolo_model)
+            # Use MPS (Metal) on Mac for GPU acceleration
+            import torch
+            if torch.backends.mps.is_available():
+                self.model.to('mps')
+                print(f"Loaded YOLO model: {yolo_model} (using MPS/Metal GPU)")
+            else:
+                print(f"Loaded YOLO model: {yolo_model} (using CPU)")
+        else:
+            self.model = None
+
+    def set_image_size(self, width: int, height: int):
+        """Set current image dimensions for coordinate scaling."""
+        self.img_width = width
+        self.img_height = height
+
+    def pixel_to_world(self, x: int, y: int) -> Optional[np.ndarray]:
+        """Convert pixel coordinates to world coordinates, with scaling if needed."""
+        if self.img_width and self.img_height:
+            scale_x = self.lt_width / self.img_width
+            scale_y = self.lt_height / self.img_height
+            x = int(x * scale_x)
+            y = int(y * scale_y)
+
+        if 0 <= x < self.lt_width and 0 <= y < self.lt_height:
+            return self.lookup_table[x, y].copy()
+        return None
+
+    def detect_vehicles(self, image: np.ndarray, conf_threshold: float = 0.5) -> List[BBox2D]:
+        """Detect vehicles using YOLO."""
+        if self.model is None:
+            return []
+
+        results = self.model(image, verbose=False)[0]
+        detections = []
+
+        for box in results.boxes:
+            class_id = int(box.cls[0])
+            confidence = float(box.conf[0])
+
+            if confidence < conf_threshold or class_id not in self.VEHICLE_CLASSES:
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            detections.append(BBox2D(
+                x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2),
+                confidence=confidence, class_id=class_id,
+                class_name=self.VEHICLE_CLASSES[class_id]
+            ))
+
+        return detections
+
+    def estimate_3d_bbox(self, bbox_2d: BBox2D) -> Optional[BBox3D]:
+        """Estimate 3D bounding box from 2D detection."""
+        x1, y1, x2, y2 = bbox_2d.x1, bbox_2d.y1, bbox_2d.x2, bbox_2d.y2
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
+
+        # Contact points (bottom of bbox, inset for tires)
+        inset = 0.15
+        left_x = int(x1 + bbox_w * inset)
+        right_x = int(x2 - bbox_w * inset)
+        bottom_y = y2
+
+        # Get world coordinates for contact points
+        left_world = self.pixel_to_world(left_x, bottom_y)
+        right_world = self.pixel_to_world(right_x, bottom_y)
+
+        if left_world is None or right_world is None:
+            return None
+
+        # Validate world coordinates
+        if np.abs(left_world[0]) > 50 or np.abs(right_world[0]) > 50:
+            return None
+
+        # Get vehicle dimensions
+        dims = self.VEHICLE_DIMENSIONS.get(bbox_2d.class_name, self.VEHICLE_DIMENSIONS['car'])
+
+        # Calculate orientation from contact points
+        lateral_direction = right_world[:2] - left_world[:2]
+        yaw = np.arctan2(lateral_direction[1], lateral_direction[0]) - np.pi/2
+
+        # Center ground position
+        center_ground = (left_world + right_world) / 2
+
+        # Observed width
+        observed_width = np.linalg.norm(right_world[:2] - left_world[:2])
+        width = observed_width if 0.5 < observed_width < 3.0 else dims['width']
+        length = dims['length']
+        height = dims['height']
+
+        # Build 3D corners in world coordinates
+        cos_yaw, sin_yaw = np.cos(yaw), np.sin(yaw)
+        half_l, half_w = length / 2, width / 2
+
+        local_corners = np.array([
+            [ half_l, -half_w, 0],
+            [ half_l,  half_w, 0],
+            [-half_l,  half_w, 0],
+            [-half_l, -half_w, 0],
+            [ half_l, -half_w, height],
+            [ half_l,  half_w, height],
+            [-half_l,  half_w, height],
+            [-half_l, -half_w, height],
+        ])
+
+        R = np.array([[cos_yaw, -sin_yaw, 0], [sin_yaw, cos_yaw, 0], [0, 0, 1]])
+        corners_world = (local_corners @ R.T) + center_ground
+
+        # Project 3D box to 2D image using CALIBRATED parameters
+        corners_image = self._project_constrained(corners_world, bbox_2d, yaw)
+
+        center_3d = np.array([center_ground[0], center_ground[1], height / 2])
+
+        return BBox3D(
+            corners_image=corners_image,
+            corners_world=corners_world,
+            center=center_3d,
+            length=length, width=width, height=height,
+            yaw=yaw, bbox_2d=bbox_2d, confidence=bbox_2d.confidence
+        )
+
+    def _project_constrained(self, corners_world: np.ndarray, bbox_2d: BBox2D, yaw: float) -> np.ndarray:
+        """
+        Project 3D corners to 2D image coordinates using calibrated parameters.
+
+        The 3D box is constructed to fit WITHIN the 2D bounding box.
+        Uses class-level calibrated parameters from manual adjustments.
+        """
+        x1, y1, x2, y2 = bbox_2d.x1, bbox_2d.y1, bbox_2d.x2, bbox_2d.y2
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
+        bbox_cx = (x1 + x2) / 2
+
+        corners_image = np.zeros((8, 2), dtype=np.float32)
+
+        # Use calibrated parameters
+        front_inset_left = self.FRONT_INSET_LEFT    # For points 0,4
+        front_inset_right = self.FRONT_INSET_RIGHT  # For points 1,5
+        depth_ratio = self.DEPTH_RATIO
+        height_ratio = self.HEIGHT_RATIO
+        shrink_ratio = self.SHRINK_RATIO
+        side_offset_ratio = self.SIDE_OFFSET_RATIO
+
+        # Front face at bottom of bbox (separate insets for left and right)
+        front_y = y2
+        front_left_x = x1 + bbox_w * front_inset_left    # Points 0,4 inset from left
+        front_right_x = x2 - bbox_w * front_inset_right  # Points 1,5 inset from right
+        front_width = front_right_x - front_left_x
+        front_cx = (front_left_x + front_right_x) / 2
+
+        # Rear face - shifted up with perspective and side offset
+        depth_up = bbox_h * depth_ratio
+        rear_y = front_y - depth_up
+        rear_width = front_width * shrink_ratio
+
+        # Apply side offset (negative = shift left)
+        side_offset = bbox_w * side_offset_ratio
+        rear_cx = front_cx + side_offset
+        rear_left_x = rear_cx - rear_width / 2
+        rear_right_x = rear_cx + rear_width / 2
+
+        # Clamp to stay within bbox boundaries (safety measure)
+        rear_left_x = max(x1, rear_left_x)
+        rear_right_x = min(x2, rear_right_x)
+
+        # Box height
+        box_height = bbox_h * height_ratio
+
+        # Bottom corners (ground plane)
+        corners_image[0] = [front_left_x, front_y]      # front-left-bottom
+        corners_image[1] = [front_right_x, front_y]     # front-right-bottom
+        corners_image[2] = [rear_right_x, rear_y]       # rear-right-bottom
+        corners_image[3] = [rear_left_x, rear_y]        # rear-left-bottom
+
+        # Top corners
+        rear_height = box_height * 0.92  # Rear height slightly less than front
+        corners_image[4] = [front_left_x, front_y - box_height]      # front-left-top
+        corners_image[5] = [front_right_x, front_y - box_height]     # front-right-top
+        corners_image[6] = [rear_right_x, rear_y - rear_height]      # rear-right-top
+        corners_image[7] = [rear_left_x, rear_y - rear_height]       # rear-left-top
+
+        return corners_image
+
+    def process_image(self, image: np.ndarray, conf_threshold: float = 0.5, verbose: bool = False) -> List[BBox3D]:
+        """Process image and generate 3D bounding boxes."""
+        h, w = image.shape[:2]
+        self.set_image_size(w, h)
+
+        detections_2d = self.detect_vehicles(image, conf_threshold)
+        if verbose:
+            print(f"Detected {len(detections_2d)} vehicles")
+
+        bboxes_3d = []
+        for det in detections_2d:
+            bbox_3d = self.estimate_3d_bbox(det)
+            if bbox_3d is not None:
+                bboxes_3d.append(bbox_3d)
+
+        if verbose:
+            print(f"Generated {len(bboxes_3d)} 3D bounding boxes")
+        return bboxes_3d
+
+    def draw_3d_box(self, image: np.ndarray, bbox: BBox3D,
+                    color: Tuple[int, int, int] = (0, 0, 255),
+                    thickness: int = 2) -> np.ndarray:
+        """Draw 3D wireframe bounding box."""
+        corners = bbox.corners_image.astype(int)
+        h, w = image.shape[:2]
+        corners = np.clip(corners, [0, 0], [w-1, h-1])
+
+        # Back edges (darker)
+        back_color = (100, 100, 100)
+        cv.line(image, tuple(corners[2]), tuple(corners[3]), back_color, thickness)
+        cv.line(image, tuple(corners[6]), tuple(corners[7]), back_color, thickness)
+        cv.line(image, tuple(corners[2]), tuple(corners[6]), back_color, thickness)
+        cv.line(image, tuple(corners[3]), tuple(corners[7]), back_color, thickness)
+
+        # Side edges
+        cv.line(image, tuple(corners[0]), tuple(corners[3]), color, thickness)
+        cv.line(image, tuple(corners[1]), tuple(corners[2]), color, thickness)
+        cv.line(image, tuple(corners[4]), tuple(corners[7]), color, thickness)
+        cv.line(image, tuple(corners[5]), tuple(corners[6]), color, thickness)
+
+        # Bottom face
+        cv.line(image, tuple(corners[0]), tuple(corners[1]), color, thickness)
+        cv.line(image, tuple(corners[1]), tuple(corners[2]), color, thickness)
+        cv.line(image, tuple(corners[2]), tuple(corners[3]), color, thickness)
+        cv.line(image, tuple(corners[3]), tuple(corners[0]), color, thickness)
+
+        # Top face
+        cv.line(image, tuple(corners[4]), tuple(corners[5]), color, thickness)
+        cv.line(image, tuple(corners[5]), tuple(corners[6]), color, thickness)
+        cv.line(image, tuple(corners[6]), tuple(corners[7]), color, thickness)
+        cv.line(image, tuple(corners[7]), tuple(corners[4]), color, thickness)
+
+        # Front face (green, thicker)
+        front_color = (0, 255, 0)
+        cv.line(image, tuple(corners[0]), tuple(corners[1]), front_color, thickness + 1)
+        cv.line(image, tuple(corners[4]), tuple(corners[5]), front_color, thickness + 1)
+        cv.line(image, tuple(corners[0]), tuple(corners[4]), front_color, thickness + 1)
+        cv.line(image, tuple(corners[1]), tuple(corners[5]), front_color, thickness + 1)
+
+        # Contact points (yellow)
+        cv.circle(image, tuple(corners[0]), 5, (0, 255, 255), -1)
+        cv.circle(image, tuple(corners[1]), 5, (0, 255, 255), -1)
+
+        return image
+
+    def visualize(self, image: np.ndarray, bboxes_3d: List[BBox3D],
+                  show_2d: bool = False, show_info: bool = True) -> np.ndarray:
+        """Visualize 3D bounding boxes."""
+        output = image.copy()
+
+        for bbox in bboxes_3d:
+            self.draw_3d_box(output, bbox, color=(0, 0, 255), thickness=2)
+
+            if show_2d:
+                cv.rectangle(output,
+                            (bbox.bbox_2d.x1, bbox.bbox_2d.y1),
+                            (bbox.bbox_2d.x2, bbox.bbox_2d.y2),
+                            (100, 100, 100), 1)
+
+            if show_info:
+                info = f"{bbox.bbox_2d.class_name} | Pos:({bbox.center[0]:.1f},{bbox.center[1]:.1f})m"
+                top_y = int(bbox.corners_image[4:8, 1].min()) - 5
+                left_x = int(bbox.corners_image[:, 0].min())
+
+                (tw, th), _ = cv.getTextSize(info, cv.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                cv.rectangle(output, (left_x, top_y - th - 4), (left_x + tw + 4, top_y), (0, 0, 0), -1)
+                cv.putText(output, info, (left_x + 2, top_y - 2),
+                          cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+
+        return output
+
+
+def main():
+    """Test the calibrated generator on a sample frame."""
+    import os
+
+    DATASET_DIR = "/Users/navaneethmalingan/3D/Uni_west_1"
+    LOOKUP_TABLE = f"{DATASET_DIR}/calibration-lookup-table.npy"
+    OUTPUT_DIR = f"{DATASET_DIR}/output"
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("=" * 60)
+    print("CALIBRATED 3D BOUNDING BOX GENERATOR - Uni_west_1")
+    print("=" * 60)
+    print(f"\nCalibrated parameters:")
+    print(f"  DEPTH_RATIO = {BBox3DGenerator.DEPTH_RATIO:.4f}")
+    print(f"  SIDE_OFFSET_RATIO = {BBox3DGenerator.SIDE_OFFSET_RATIO:.4f}")
+    print(f"  HEIGHT_RATIO = {BBox3DGenerator.HEIGHT_RATIO:.4f}")
+    print(f"  SHRINK_RATIO = {BBox3DGenerator.SHRINK_RATIO:.4f}")
+    print(f"  FRONT_INSET_LEFT = {BBox3DGenerator.FRONT_INSET_LEFT:.4f}")
+    print(f"  FRONT_INSET_RIGHT = {BBox3DGenerator.FRONT_INSET_RIGHT:.4f}")
+
+    generator = BBox3DGenerator(LOOKUP_TABLE)
+
+    # Test on frame 100 of first video
+    video_path = f"{DATASET_DIR}/GOPR0574.MP4"
+    cap = cv.VideoCapture(video_path)
+    cap.set(cv.CAP_PROP_POS_FRAMES, 100)
+    ret, frame = cap.read()
+    cap.release()
+
+    if ret:
+        bboxes_3d = generator.process_image(frame, conf_threshold=0.3)
+
+        if bboxes_3d:
+            print(f"\nDetected {len(bboxes_3d)} vehicles:")
+            for i, bbox in enumerate(bboxes_3d):
+                print(f"  {i+1}. {bbox.bbox_2d.class_name} at ({bbox.center[0]:.2f}, {bbox.center[1]:.2f})m")
+
+            output = generator.visualize(frame, bboxes_3d, show_2d=True, show_info=True)
+            output_path = f"{OUTPUT_DIR}/calibrated_test.jpg"
+            cv.imwrite(output_path, output)
+            print(f"\nSaved to: {output_path}")
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+env
+\.vs
+calibration/*
+
+__pycache__/
+utils/__pycache__/
+.DS_Store
+
