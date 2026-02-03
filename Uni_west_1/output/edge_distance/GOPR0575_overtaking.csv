@@ -1,0 +1,2 @@
+frame_start,frame_end,vehicle_a,vehicle_b,min_lateral_gap_m,min_edge_distance_m,overtaking_vehicle
+1040,1044,68,69,0.38,0.52,69
